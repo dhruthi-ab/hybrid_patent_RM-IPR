@@ -6,6 +6,8 @@ Computes:
 - nDCG@K (K=5, 10)
 - Mean Average Precision (MAP)
 - Mean Reciprocal Rank (MRR)
+- Vocabulary Mismatch Recovery Rate (VMRR@10)
+- Paired Statistical Significance Testing (Wilcoxon Signed-Rank Test vs. BM25 Baseline)
 - Alpha Sweep Optimization (Finding mathematically optimal lexical vs semantic weight)
 """
 
@@ -14,6 +16,7 @@ import os
 from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 
 def compute_average_precision(ranked_ids: List[str], relevant_set: set) -> float:
@@ -51,8 +54,11 @@ def compute_ndcg_at_k(ranked_ids: List[str], relevant_set: set, k: int = 10) -> 
     return float(dcg / idcg) if idcg > 0 else 0.0
 
 
-def evaluate_engine_benchmarks(search_engine, benchmark_queries_path: str = "data/benchmark_queries.json") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Evaluate retrieval methods across all benchmark test queries."""
+def evaluate_engine_benchmarks(
+    search_engine,
+    benchmark_queries_path: str = "data/benchmark_queries.json"
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate retrieval methods across all benchmark test queries with statistical significance tests."""
     if not os.path.exists(benchmark_queries_path):
         raise FileNotFoundError(f"Benchmark queries file not found at: {benchmark_queries_path}")
 
@@ -67,8 +73,23 @@ def evaluate_engine_benchmarks(search_engine, benchmark_queries_path: str = "dat
         ("Neural Cross-Encoder Re-Ranker", "neural_rerank", 0.5)
     ]
 
+    # Precompute lexical mismatch sets: relevant documents that have zero lexical term overlap with query
+    query_mismatches = {}
+    for q in queries:
+        q_tokens = set(search_engine.patents["text"].iloc[0:1].apply(lambda _: [w.lower() for w in q["query"].split()]).iloc[0])
+        # Find which relevant IDs share 0 vocabulary words
+        mismatched_ids = set()
+        for rel_id in q["relevant_ids"]:
+            doc_rows = search_engine.patents[search_engine.patents["patent_id"] == rel_id]
+            if not doc_rows.empty:
+                doc_words = set(str(doc_rows.iloc[0]["text"]).lower().split())
+                if not q_tokens.intersection(doc_words):
+                    mismatched_ids.add(rel_id)
+        query_mismatches[q["query"]] = mismatched_ids
+
     all_results = []
     ks = [1, 5, 10]
+    ap_by_mode = {}
 
     for mode_name, mode_key, lex_w in modes:
         mode_aps = []
@@ -76,6 +97,8 @@ def evaluate_engine_benchmarks(search_engine, benchmark_queries_path: str = "dat
         mode_p_at_k = {k: [] for k in ks}
         mode_r_at_k = {k: [] for k in ks}
         mode_ndcg_at_k = {k: [] for k in [5, 10]}
+        total_mismatched = 0
+        recovered_mismatched = 0
 
         for q in queries:
             query_str = q["query"]
@@ -100,6 +123,15 @@ def evaluate_engine_benchmarks(search_engine, benchmark_queries_path: str = "dat
             for k in [5, 10]:
                 mode_ndcg_at_k[k].append(compute_ndcg_at_k(retrieved_ids, rel_set, k=k))
 
+            # Vocabulary mismatch recovery
+            mismatched_set = query_mismatches.get(query_str, set())
+            if mismatched_set:
+                total_mismatched += len(mismatched_set)
+                recovered_mismatched += len(set(retrieved_ids[:10]).intersection(mismatched_set))
+
+        ap_by_mode[mode_name] = mode_aps
+        vmrr = (recovered_mismatched / max(1, total_mismatched)) * 100.0 if total_mismatched > 0 else 0.0
+
         row = {
             "Method": mode_name,
             "MAP": np.mean(mode_aps),
@@ -110,9 +142,36 @@ def evaluate_engine_benchmarks(search_engine, benchmark_queries_path: str = "dat
             "Recall@5": np.mean(mode_r_at_k[5]),
             "Recall@10": np.mean(mode_r_at_k[10]),
             "nDCG@5": np.mean(mode_ndcg_at_k[5]),
-            "nDCG@10": np.mean(mode_ndcg_at_k[10])
+            "nDCG@10": np.mean(mode_ndcg_at_k[10]),
+            "VMRR@10 (%)": vmrr
         }
         all_results.append(row)
+
+    # Compute Statistical Significance (Wilcoxon Signed-Rank Test vs BM25 Baseline)
+    bm25_aps = ap_by_mode.get("BM25 (Lexical Only)", [])
+    for row in all_results:
+        m_name = row["Method"]
+        if m_name == "BM25 (Lexical Only)" or not bm25_aps:
+            row["p-value (vs BM25)"] = "Baseline"
+        else:
+            diff = np.array(ap_by_mode[m_name]) - np.array(bm25_aps)
+            non_zero = diff[diff != 0]
+            if len(non_zero) >= 5:
+                try:
+                    _, p_val = stats.wilcoxon(non_zero, alternative="two-sided")
+                except Exception:
+                    _, p_val = stats.ttest_rel(ap_by_mode[m_name], bm25_aps)
+            elif len(non_zero) > 0:
+                _, p_val = stats.ttest_rel(ap_by_mode[m_name], bm25_aps)
+            else:
+                p_val = 1.0
+
+            if p_val < 0.01:
+                row["p-value (vs BM25)"] = f"{p_val:.3f} **"
+            elif p_val < 0.05:
+                row["p-value (vs BM25)"] = f"{p_val:.3f} *"
+            else:
+                row["p-value (vs BM25)"] = f"{p_val:.3f} (n.s.)"
 
     summary_df = pd.DataFrame(all_results).set_index("Method")
 

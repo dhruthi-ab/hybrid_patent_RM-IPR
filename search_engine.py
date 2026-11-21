@@ -173,12 +173,17 @@ class HybridPatentSearch:
         lexical_weight: float = 0.5,
         mode: str = "hybrid_weighted",  # 'hybrid_weighted', 'hybrid_rrf', 'neural_rerank', 'semantic_only', 'lexical_only'
         ipc_filter: Optional[str] = None,
-        top_candidates_for_rerank: int = 20
+        top_candidates_for_rerank: int = 20,
+        claims_text: Optional[str] = None
     ) -> Tuple[pd.DataFrame, Dict]:
         """Execute high-precision patent retrieval across lexical and dense semantic modalities."""
         query_str = str(query).strip()
         if not query_str:
             return pd.DataFrame(), {}
+
+        # Extract claims_text if not explicitly provided but embedded in query
+        if not claims_text and ". Claims: " in query_str:
+            claims_text = query_str.split(". Claims: ", 1)[1].strip()
 
         # Optional domain pre-filtering
         indices = np.arange(len(self.patents))
@@ -239,7 +244,8 @@ class HybridPatentSearch:
         if mode == "neural_rerank" and self._cross_encoder is not None and len(filtered_patents) > 1:
             candidate_k = min(len(filtered_patents), max(top_k * 2, top_candidates_for_rerank))
             candidates = filtered_patents.sort_values("hybrid_score", ascending=False).head(candidate_k)
-            pairs = [[query_str, doc_text[:512]] for doc_text in candidates["text"]]
+            # Use word-level truncation up to 512 words instead of 512 raw characters to preserve claims
+            pairs = [[query_str, " ".join(doc_text.split()[:512])] for doc_text in candidates["text"]]
 
             try:
                 ce_logits = self._cross_encoder.predict(pairs)
@@ -257,7 +263,13 @@ class HybridPatentSearch:
         # 5. Novelty Risk Assessment & Keyword Differential Analysis
         novelty_analysis = self._analyze_novelty(query_tokens, results)
 
-        # 6. Query Landscape Projection Coordinates
+        # 6. Clause-by-Clause Claim Chart (35 U.S.C. § 102 Anticipation Matrix)
+        if not results.empty and claims_text:
+            novelty_analysis["claim_limitations"] = self.analyze_claim_limitations(claims_text, results.iloc[0])
+        else:
+            novelty_analysis["claim_limitations"] = []
+
+        # 7. Query Landscape Projection Coordinates
         query_coords = [0.0, 0.0]
         if self.pca is not None:
             try:
@@ -314,3 +326,139 @@ class HybridPatentSearch:
             "top_match_id": str(top_results["patent_id"].iloc[0]),
             "top_match_title": str(top_results["title"].iloc[0])
         }
+
+    def analyze_claim_limitations(self, claim_text: str, top_doc_row: pd.Series) -> List[Dict]:
+        """Decompose Claim 1 into constituent clauses and compute 35 U.S.C. § 102/103 anticipation matrix."""
+        if not claim_text or not str(claim_text).strip():
+            return []
+
+        # Split claim by semicolons, sentence boundaries, or numbered elements
+        raw_clauses = re.split(r";\s*|\.\s+(?=[A-Z0-9])|\bwherein\b|\bcomprising:?\b", str(claim_text), flags=re.IGNORECASE)
+        clauses = []
+        for c in raw_clauses:
+            cleaned = re.sub(r"^\s*(?:\d+[\.\)]|\([a-z0-9]+\)|and\s+)\s*", "", c.strip(), flags=re.IGNORECASE)
+            if len(cleaned) > 15:
+                clauses.append(cleaned)
+
+        if not clauses:
+            clauses = [str(claim_text).strip()]
+
+        # Prepare top document sentences/claims for comparison
+        doc_claims = str(top_doc_row.get("claims", "")).strip()
+        doc_abstract = str(top_doc_row.get("abstract", "")).strip()
+        doc_ref_text = (doc_claims + ". " + doc_abstract) if doc_claims else doc_abstract
+
+        doc_sentences = [s.strip() for s in re.split(r"[;\.]\s*", doc_ref_text) if len(s.strip()) > 15]
+        if not doc_sentences:
+            doc_sentences = [doc_ref_text] if doc_ref_text else ["prior art disclosure"]
+
+        doc_embs = self.model.encode(doc_sentences, normalize_embeddings=True, show_progress_bar=False)
+        clause_embs = self.model.encode(clauses, normalize_embeddings=True, show_progress_bar=False)
+
+        # Compute cosine similarity matrix
+        sim_matrix = clause_embs @ doc_embs.T
+
+        limitations = []
+        for i, clause in enumerate(clauses):
+            max_sim = float(np.max(sim_matrix[i]))
+            best_match_idx = int(np.argmax(sim_matrix[i]))
+            best_match_excerpt = doc_sentences[best_match_idx] if best_match_idx < len(doc_sentences) else ""
+            if len(best_match_excerpt) > 120:
+                best_match_excerpt = best_match_excerpt[:120] + "..."
+
+            if max_sim >= 0.70:
+                status = "Anticipated (Disclosed)"
+                status_code = "ANTICIPATED"
+                color = "#EF4444"
+                description = "Direct or strong technical anticipation found in prior art disclosure."
+            elif max_sim >= 0.48:
+                status = "Partially Disclosed / Obvious Variant"
+                status_code = "OBVIOUS_VARIANT"
+                color = "#F59E0B"
+                description = "Functionally related structure identified; may require narrowing."
+            else:
+                status = "Novel Claim Element (Inventive Step)"
+                status_code = "NOVEL"
+                color = "#10B981"
+                description = "Distinctive limitation not observed in the primary cited prior art."
+
+            limitations.append({
+                "index": i + 1,
+                "limitation_text": clause,
+                "similarity_score": round(max_sim, 3),
+                "status": status,
+                "status_code": status_code,
+                "color": color,
+                "description": description,
+                "prior_art_excerpt": best_match_excerpt
+            })
+
+        return limitations
+
+    def generate_patentability_report(
+        self,
+        query_title: str,
+        query_abstract: str,
+        query_claims: str,
+        results_df: pd.DataFrame,
+        novelty_analysis: Dict
+    ) -> str:
+        """Generate a formal Examiner-style Patentability Search & Novelty Opinion Report in Markdown."""
+        lines = [
+            "# ⚖️ PATENTABILITY PRIOR-ART EXAMINATION REPORT",
+            "**Framework:** RM-IPR Hybrid Lexical-Semantic Analysis (35 U.S.C. § 102/103 Evaluation)",
+            "",
+            "## 1. Subject Invention Disclosure",
+            f"- **Title:** {query_title or 'Untitled Invention'}",
+            f"- **Abstract / Description:** {query_abstract or 'Not provided'}",
+            f"- **Key Claim 1:** {query_claims or 'Not provided'}",
+            "",
+            "## 2. Novelty & Collision Risk Assessment",
+            f"- **Prior-Art Collision Risk:** **{novelty_analysis.get('risk_score', 0)}%**",
+            f"- **Novelty Verdict:** **{novelty_analysis.get('risk_label', 'Unknown')}**",
+            f"- **Analysis Summary:** {novelty_analysis.get('summary', '')}",
+            "",
+            "### Conceptual Term Overlap",
+            f"- **Overlapping Prior-Art Terms:** {', '.join(novelty_analysis.get('overlapping_keywords', [])) or 'None detected'}",
+            f"- **Distinctive Novel Terms:** {', '.join(novelty_analysis.get('distinctive_novel_keywords', [])) or 'None detected'}",
+            "",
+            "## 3. Element-by-Element Claim Chart (35 U.S.C. § 102 Novelty Breakdown)"
+        ]
+
+        claim_limitations = novelty_analysis.get("claim_limitations", [])
+        if claim_limitations:
+            lines.append("| Limitation # | Subject Claim Clause | Match Score | 35 U.S.C. Status | Cited Prior-Art Excerpt |")
+            lines.append("|:---:|:---|:---:|:---:|:---|")
+            for lim in claim_limitations:
+                clause_escaped = lim['limitation_text'].replace('|', '\\|')
+                excerpt_escaped = lim['prior_art_excerpt'].replace('|', '\\|')
+                lines.append(f"| {lim['index']} | {clause_escaped} | `{lim['similarity_score']:.3f}` | **{lim['status']}** | *\"{excerpt_escaped}\"* |")
+        else:
+            lines.append("*No claim limitations specified for clause-level anticipation breakdown.*")
+
+        lines.extend([
+            "",
+            "## 4. Top Cited Prior-Art References",
+            "| Rank | Patent ID | Title | Hybrid Score | Lexical (BM25) | Semantic (Dense) | CPC / IPC |",
+            "|:---:|:---:|:---|:---:|:---:|:---:|:---:|"
+        ])
+
+        if not results_df.empty:
+            for rank, (_, row) in enumerate(results_df.iterrows()):
+                lines.append(
+                    f"| {rank+1} | `{row['patent_id']}` | {row['title']} | `{row['hybrid_score']:.3f}` | "
+                    f"`{row['lexical_score']:.3f}` | `{row['semantic_score']:.3f}` | `{row.get('cpc_class', 'N/A')}` |"
+                )
+
+        lines.extend([
+            "",
+            "## 5. Patent Attorney / Examiner Recommendations",
+            "1. **Inventive Step Strategy:** Emphasize the identified *Novel Claim Elements* in independent claims to establish non-obviousness over the primary cited reference.",
+            "2. **Claim Narrowing:** If collision risk exceeds 50%, integrate secondary dependent limitations addressing the technical differentiator.",
+            "3. **Prior-Art Disclosure:** Disclose the identified top matching patent reference in Information Disclosure Statements (IDS).",
+            "",
+            "---",
+            "*Generated by Hybrid AI Patent Intelligence Platform (RM-IPR)*"
+        ])
+
+        return "\n".join(lines)

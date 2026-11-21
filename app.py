@@ -306,18 +306,37 @@ with tabs[0]:
                     top_k=top_k,
                     lexical_weight=lexical_weight,
                     mode=retrieval_mode,
-                    ipc_filter=domain_filter if domain_filter != "All Domains" else None
+                    ipc_filter=domain_filter if domain_filter != "All Domains" else None,
+                    claims_text=claims_input.strip() if claims_input.strip() else None
                 )
                 search_time_ms = round((time.time() - start_t) * 1000, 1)
 
             st.markdown("### 📋 Executive Prior-Art Assessment")
+
+            # Report Exporter Button
+            top_match_id = results_df["patent_id"].iloc[0] if not results_df.empty else "N/A"
+            report_md = search_engine.generate_patentability_report(
+                query_title=title_input,
+                query_abstract=desc_input,
+                query_claims=claims_input,
+                results_df=results_df,
+                novelty_analysis=novelty
+            )
+            col_rep1, col_rep2 = st.columns([2, 1])
+            with col_rep2:
+                st.download_button(
+                    label="📥 Export Patentability Report (.md)",
+                    data=report_md,
+                    file_name=f"patentability_report_{top_match_id}.md",
+                    mime="text/markdown",
+                    use_container_width=True
+                )
 
             # Top Metric Cards
             m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("Retrieved Documents", f"{len(results_df)} patents", f"{search_time_ms} ms")
             with m2:
-                top_match_id = results_df["patent_id"].iloc[0] if not results_df.empty else "N/A"
                 st.metric("Top Prior-Art Match", top_match_id)
             with m3:
                 top_score = results_df["hybrid_score"].iloc[0] if not results_df.empty else 0.0
@@ -415,6 +434,33 @@ with tabs[0]:
                     st.markdown(badges, unsafe_allow_html=True)
                 else:
                     st.info("All query keywords are documented in the cited disclosure.")
+
+            # 35 U.S.C. § 102/103 Element-by-Element Claim Chart
+            st.markdown("---")
+            st.markdown("#### ⚖️ 35 U.S.C. § 102/103 Element-by-Element Claim Chart")
+            st.caption("Clause-by-clause anticipation analysis decomposing Claim 1 against primary prior-art disclosure.")
+            claim_lims = novelty.get("claim_limitations", [])
+            if claim_lims:
+                for lim in claim_lims:
+                    b_color = lim["color"]
+                    st.markdown(
+                        f"""<div style="background: rgba(30, 41, 59, 0.7); border-left: 4px solid {b_color}; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; border-top: 1px solid rgba(255,255,255,0.05); border-right: 1px solid rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.05);">
+                            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                                <span style="font-weight: 600; color: #f1f5f9; font-size: 0.95rem;">Limitation {lim['index']}: {lim['limitation_text']}</span>
+                                <span style="background: {b_color}22; color: {b_color}; border: 1px solid {b_color}66; padding: 2px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem;">
+                                    {lim['status']} (Sim: {lim['similarity_score']:.3f})
+                                </span>
+                            </div>
+                            <div style="font-size: 0.85rem; color: #94a3b8; margin-top: 6px;">
+                                <strong style="color: #cbd5e1;">Prior-Art Excerpt:</strong> <em>"{lim['prior_art_excerpt']}"</em>
+                            </div>
+                        </div>""",
+                        unsafe_allow_html=True
+                    )
+            elif claims_input.strip():
+                st.info("Analyzing claim clauses...")
+            else:
+                st.info("Enter Key Independent Claim 1 in the search form to generate an automated 35 U.S.C. § 102/103 element-by-element claim chart.")
 
             # Detailed Results Cards
             st.markdown("---")
@@ -528,7 +574,10 @@ with tabs[2]:
             sweep_df = st.session_state["benchmark_sweep"]
 
             st.markdown("### 🏆 Comprehensive Retrieval Performance Metrics")
-            st.dataframe(summary_df.style.highlight_max(axis=0, color="#1e3a8a"), use_container_width=True)
+            st.caption("Includes **p-value (vs BM25)** via two-sided Wilcoxon Signed-Rank / paired t-test (*p < 0.05, **p < 0.01) and **VMRR@10** (Vocabulary Mismatch Recovery Rate for lexically disjoint relevant prior art).")
+            # Highlight numeric max
+            numeric_cols = [c for c in summary_df.columns if c not in ["p-value (vs BM25)"]]
+            st.dataframe(summary_df.style.highlight_max(subset=numeric_cols, axis=0, color="#1e3a8a"), use_container_width=True)
 
             col_g1, col_g2 = st.columns(2)
             with col_g1:
@@ -597,6 +646,22 @@ with tabs[2]:
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)"
                 )
+                st.plotly_chart(fig_sweep, use_container_width=True)
+
+            # Row 3: Vocabulary Mismatch Recovery Rate
+            if "VMRR@10 (%)" in summary_df.columns:
+                st.markdown("#### 🔍 Vocabulary Mismatch Mitigation (Research Gap Resolution)")
+                fig_vmrr = px.bar(
+                    summary_df.reset_index(),
+                    x="Method",
+                    y="VMRR@10 (%)",
+                    text_auto=".1f",
+                    title="Vocabulary Mismatch Recovery Rate (% of Lexically Invisible Prior Art Retrieved in Top 10)",
+                    color="Method",
+                    height=320
+                )
+                fig_vmrr.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+                st.plotly_chart(fig_vmrr, use_container_width=True)
                 st.plotly_chart(fig_sweep, use_container_width=True)
     else:
         st.warning("Ground-truth benchmark query file not detected in `data/benchmark_queries.json`.")

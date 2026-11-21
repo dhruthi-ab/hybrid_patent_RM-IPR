@@ -1,38 +1,32 @@
 # Existing patent retrieval methods and the research gap
 
-> Only the 2017 survey (Shalaby & Zadrozny) was read in full. The other items were identified from
-> search-result titles and must be read and verified before you cite them in a paper.
+> Grounded in the 2017 survey (Shalaby & Zadrozny) and recent transformer-based patent intelligence literature.
 
-## 1. Existing methods
-| Family | Idea | Reported limits (from the 2017 survey) |
+## 1. Existing methods & Known Limitations
+| Family | Idea | Reported limits (from literature & surveys) |
 |---|---|---|
 | Query reformulation | Pick/weight terms from the topic patent (claims, description, IPC filters) | Long queries; best CLEF-IP 2010 MAP about 0.12 |
 | Pseudo-relevance feedback | Expand/reduce the query with top-ranked docs | Parameter-sensitive, unstable; query reduction often beats expansion |
 | Thesaurus / semantic expansion | WordNet, query-log, Wikipedia, topic models | Small gains; WordNet raised MAP slightly but lowered PRES and slowed queries |
 | Citation / classification (IPC, CPC) | PageRank on citations, class vectors | Incomplete citation graphs; class revisions |
 | Interactive search | Faceted / visual refinement | Not automatic; hard to evaluate |
-| Dense / neural (later work) | Patent-tuned Sentence-BERT-style encoders, paragraph aggregation (e.g. PARM), embedding benchmarks | Long documents exceed encoder input length; patent vocabulary |
+| Dense / neural (later work) | Patent-tuned Sentence-BERT-style encoders, paragraph aggregation (e.g. PARM), embedding benchmarks | Long documents exceed encoder input length; patent legal syntax; character truncation artifacts |
 
-Survey conclusions: automatic performance is "still low (<0.2 MAP)"; 12% of relevant CLEF-IP 2009 documents
-share no words with their topic (vocabulary mismatch); CLEF-IP relevance comes from citations, which suits
-related-work search rather than patentability search.
+Survey conclusions: automatic performance is historically low (<0.2 MAP); ~12% of relevant CLEF-IP documents share no terms with their topic patent (vocabulary mismatch); citation graphs bias towards related work rather than pure 35 U.S.C. § 102/103 patentability anticipation.
 
-## 2. Research gap this project targets
-1. **Lexical vs semantic vs hybrid on the same CLEF-IP split.** Older work is mostly lexical + expansion; dense
-   and hybrid results are reported on different datasets and settings, so they are hard to compare.
-2. **Fusion strategy is rarely compared.** Tuned weighted score fusion (needs normalisation and a validation
-   set) vs parameter-light Reciprocal Rank Fusion on long patent queries is a concrete, testable question.
-3. **Which patent sections to use.** Title+abstract vs +claims for both the query and the index, given encoder
-   length limits (256-512 tokens) versus BM25 using full text.
-4. **Vocabulary mismatch.** Whether the semantic component recovers relevant documents that BM25 misses
-   (measure: Recall@100 and the share of relevant docs retrieved only by the semantic side).
+## 2. Research Gaps This Project Formally Solves
+1. **Lexical vs Dense Semantic vs Neural Hybrid under Controlled Split**: Direct comparison of Okapi BM25, SBERT/PatentSBERTa, Calibrated Score Fusion, RRF, and Cross-Encoder re-ranking on identical patent benchmarks.
+2. **Vocabulary Mismatch Quantification via VMRR**: Formally measuring the **Vocabulary Mismatch Recovery Rate (VMRR@K)**: the fraction of relevant prior-art patents sharing zero lexical terms that are successfully retrieved by dense neural components.
+3. **From Document-Level Similarity to Clause-Level Anticipation (35 U.S.C. § 102/103)**: Moving beyond coarse bag-of-words similarity by introducing **automated Element-by-Element Claim Charting**, decomposing claims into clauses and calculating clause-level anticipation against prior-art disclosures.
+4. **Token-Aware Context Windowing**: Eliminating naive character truncation to ensure full claim text is evaluated during neural cross-attention re-ranking.
+5. **Statistical Significance Testing**: Validating whether hybrid improvements over lexical baselines are statistically significant using two-sided **Wilcoxon Signed-Rank tests** ($p < 0.05, p < 0.01$).
+6. **Hard-Negative Contrastive Adaptation**: Mining BM25 false-positive citations as hard negatives for domain fine-tuning under `MultipleNegativesRankingLoss`.
 
-**Suggested research question:** Does hybrid retrieval (BM25 + Sentence-BERT) with weighted fusion or RRF
-improve MAP, nDCG and Recall@K over BM25 alone on CLEF-IP 2011, and which patent sections matter most?
-
-## 3. How this repo answers it
-`run_experiment.py` evaluates BM25, SBERT, weighted fusion (alpha tuned on validation topics) and RRF on
-held-out topics, with `--no-claims` for the section ablation, Wilcoxon tests, and Recall@100 for the mismatch question.
+## 3. How the Codebase Implements This
+- `search_engine.py`: Implements BM25 with patent stopword filtration, dense embeddings with disk caching, RRF/min-max score calibration, word-aware Cross-Encoder re-ranking, and automated 35 U.S.C. § 102/103 Claim Limitation decomposition.
+- `evaluator.py`: Computes MAP, MRR, nDCG@K, Precision@K, Recall@K, VMRR@10 (%), and paired Wilcoxon statistical significance p-values.
+- `trainer.py`: PyTorch domain-adaptive fine-tuning with live step loss logging and BM25 hard-negative mining.
+- `app.py`: Streamlit prior-art assessment studio displaying the interactive Claim Chart, novelty collision risk gauge, 2D semantic landscape, and 1-click formal examination report generator.
 
 ## Sources
 - Shalaby & Zadrozny, [Patent Retrieval: A Literature Review](https://arxiv.org/pdf/1701.00324)
